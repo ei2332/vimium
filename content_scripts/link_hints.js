@@ -159,6 +159,31 @@ const availableModes = [
   FOCUS_LINK,
 ];
 
+async function clickJavaScriptLink(element, url) {
+  if (Utils.isFirefox()) {
+    return chrome.runtime.sendMessage({ handler: "openUrlInCurrentTab", url });
+  }
+
+  // Click in the page's world so its click handlers and JavaScript URL run in order.
+  const attributeName = "data-vimium-main-world-click";
+  const previousValue = element.getAttribute(attributeName);
+  const clickId = Array.from(
+    crypto.getRandomValues(new Uint32Array(4)),
+    (word) => word.toString(16).padStart(8, "0"),
+  ).join("");
+  element.setAttribute(attributeName, clickId);
+
+  try {
+    const clicked = await chrome.runtime.sendMessage({ handler: "clickElementInMainWorld", clickId });
+    if (clicked === false) DomUtils.simulateClick(element);
+  } finally {
+    if (element.getAttribute(attributeName) === clickId) {
+      if (previousValue == null) element.removeAttribute(attributeName);
+      else element.setAttribute(attributeName, previousValue);
+    }
+  }
+}
+
 const HintCoordinator = {
   onExit: [],
   localHints: null,
@@ -377,7 +402,7 @@ class LinkHintsMode {
     //   "timeout" - waiting for a pause in typing before confirming.
     this.confirming = null;
 
-    if (hintDescriptors.length === 0) {
+    if (hintDescriptors.length === 0 && !this.supportsBookmarkShortcuts()) {
       HUD.show("No links to select.", 2000);
       return;
     }
@@ -415,8 +440,13 @@ class LinkHintsMode {
       }
     });
 
-    this.renderHints();
-    this.setIndicator();
+    if (this.hintMarkers.length > 0) this.renderHints();
+    else this.setIndicator();
+  }
+
+  supportsBookmarkShortcuts() {
+    return !Settings.get("filterLinkHints") &&
+      [OPEN_IN_CURRENT_TAB, OPEN_IN_NEW_BG_TAB].includes(this.mode);
   }
 
   renderHints() {
@@ -479,7 +509,10 @@ class LinkHintsMode {
       const typedCharacters = this.markerMatcher.linkTextKeystrokeQueue
         ? this.markerMatcher.linkTextKeystrokeQueue.join("")
         : "";
-      const indicator = this.mode.indicator + (typedCharacters ? `: \"${typedCharacters}\"` : "") +
+      const action = this.hintMarkers.length === 0 && this.supportsBookmarkShortcuts()
+        ? "Open bookmark (1–9)"
+        : this.mode.indicator;
+      const indicator = action + (typedCharacters ? `: \"${typedCharacters}\"` : "") +
         ".";
       this.hintMode.setIndicator(indicator);
     }
@@ -524,6 +557,27 @@ class LinkHintsMode {
       return;
     }
     if (event.repeat) return;
+
+    if (
+      this.supportsBookmarkShortcuts() && /^[1-9]$/.test(event.key) &&
+      !event.altKey && !event.ctrlKey && !event.metaKey &&
+      this.markerMatcher.hintKeystrokeQueue.length === 0 &&
+      (this.hintMarkers.length === 0 || !this.markerMatcher.linkHintCharacters.includes(event.key))
+    ) {
+      HintCoordinator.sendMessage("exit", { isSuccess: false });
+      chrome.runtime.sendMessage({
+        handler: "openBookmarkBarItem",
+        index: Number(event.key) - 1,
+        openInNewTab: this.mode === OPEN_IN_NEW_BG_TAB,
+      }).then((status) => {
+        if (status === "not-found") {
+          HUD.show(`Bookmark bar item ${event.key} does not exist.`, 2000);
+        } else if (status === "folder") {
+          HUD.show(`Bookmark bar item ${event.key} is a folder.`, 2000);
+        }
+      });
+      return handlerStack.suppressEvent;
+    }
 
     // NOTE(smblott) The modifier behaviour here applies only to alphabet hints.
     if (
@@ -748,6 +802,13 @@ class LinkHintsMode {
             globalThis.focus();
             return DomUtils.simulateSelect(clickEl);
           } else {
+            const url = clickEl.closest?.("a[href], area[href]")?.href;
+            const opensLink = [OPEN_IN_CURRENT_TAB, OPEN_IN_NEW_BG_TAB].includes(this.mode);
+            if (opensLink && typeof url === "string" && /^javascript:/i.test(url)) {
+              HintCoordinator.lastClickedElementRef = new WeakRef(clickEl);
+              return clickJavaScriptLink(clickEl, url);
+            }
+
             const clickActivator = (modifiers) => (link) => DomUtils.simulateClick(link, modifiers);
             const linkActivator = this.mode.linkActivator != null
               ? this.mode.linkActivator

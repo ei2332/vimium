@@ -628,6 +628,48 @@ const sendRequestHandlers = {
     });
   },
   openUrlInCurrentTab: TabOperations.openUrlInCurrentTab,
+  async openBookmarkBarItem(request, sender) {
+    const { index, openInNewTab } = request;
+    if (!Number.isInteger(index) || index < 0 || index > 8) return "not-found";
+
+    const [root] = await chrome.bookmarks.getTree();
+    const folders = root?.children ?? [];
+    // Newer Chromium exposes folderType. Older Chromium and Firefox use stable folder IDs.
+    const bookmarkBar = folders.find((folder) => folder.folderType === "bookmarks-bar") ??
+      folders.find((folder) => folder.id === "1" || folder.id === "toolbar_____");
+    const bookmark = bookmarkBar?.children?.[index];
+    if (bookmark == null) return "not-found";
+    if (bookmark.url == null) return "folder";
+
+    const openRequest = { ...request, url: bookmark.url };
+    if (openInNewTab) {
+      await TabOperations.openUrlInNewTab({ ...openRequest, active: false });
+    } else {
+      await TabOperations.openUrlInCurrentTab(openRequest, sender);
+    }
+    return "opened";
+  },
+  async clickElementInMainWorld({ clickId }, sender) {
+    if (typeof clickId !== "string" || !/^[a-f0-9]{32}$/.test(clickId)) return false;
+
+    try {
+      const [injection] = await chrome.scripting.executeScript({
+        target: { tabId: sender.tab.id, frameIds: [sender.frameId] },
+        world: "MAIN",
+        func: (id) => {
+          const element = document.querySelector(`[data-vimium-main-world-click="${id}"]`);
+          if (typeof element?.click !== "function") return false;
+          element.click();
+          return true;
+        },
+        args: [clickId],
+      });
+      return injection?.result === true;
+    } catch {
+      // The originating document may have navigated or may not allow script injection.
+      return false;
+    }
+  },
   openOptionsPageInNewTab(request) {
     return chrome.tabs.create({
       url: chrome.runtime.getURL("pages/options.html"),
